@@ -4,6 +4,10 @@ import logging
 import threading
 import asyncio
 import re
+import time
+import difflib
+import unicodedata
+from pathlib import Path
 from html import escape as html_escape
 from datetime import datetime, timedelta, timezone
 
@@ -27,6 +31,9 @@ INDEX_CHANNEL_ID_ENV = os.getenv("INDEX_CHANNEL_ID", "").strip()
 INDEX_WEBSITE_URL = os.getenv("INDEX_WEBSITE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "/var/data/anime.db")
+BACKUP_DIR = os.getenv("BACKUP_DIR", str(Path(DB_PATH).parent / "backups"))
+BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "24")))
+BACKUP_KEEP_COUNT = max(1, int(os.getenv("BACKUP_KEEP_COUNT", "7")))
 DEFAULT_EXPIRY = int(os.getenv("DEFAULT_EXPIRY_MINUTES", "10"))
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -36,6 +43,7 @@ logger = logging.getLogger("anime-channel-finder")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db_lock = threading.RLock()
 db.execute("PRAGMA foreign_keys=ON")
+db.execute("PRAGMA busy_timeout=5000")
 db.execute("""
     CREATE TABLE IF NOT EXISTS anime (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +66,40 @@ db.execute(
     (str(DEFAULT_EXPIRY),)
 )
 db.commit()
+
+
+def create_database_backup():
+    """Create a consistent SQLite backup and keep only the newest configured copies."""
+    backup_dir = Path(BACKUP_DIR)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-UTC")
+    backup_path = backup_dir / f"anime-{stamp}.db"
+    with db_lock:
+        target = sqlite3.connect(str(backup_path), timeout=30)
+        try:
+            db.backup(target)
+            target.commit()
+        finally:
+            target.close()
+    backups = sorted(backup_dir.glob("anime-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old_backup in backups[BACKUP_KEEP_COUNT:]:
+        try:
+            old_backup.unlink()
+        except OSError:
+            logger.warning("Could not remove old database backup %s", old_backup, exc_info=True)
+    logger.info("Database backup created: %s", backup_path)
+    return backup_path
+
+
+def _automatic_backup_loop():
+    """Make a backup on startup and then at the configured interval."""
+    while True:
+        try:
+            create_database_backup()
+        except Exception:
+            logger.exception("Automatic database backup failed")
+        time.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
 
 app = Flask(__name__)
 telegram_app = Application.builder().token(BOT_TOKEN).build()
@@ -93,6 +135,39 @@ def get_anime(name):
             "SELECT id,name,poster_file_id FROM anime WHERE lower(name)=lower(?)",
             (name.strip(),)
         ).fetchone()
+
+
+def normalize_anime_name(value):
+    """Normalize titles so case, punctuation, and extra spaces do not matter."""
+    value = unicodedata.normalize("NFKC", value or "").casefold()
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    return " ".join(value.split())
+
+
+def suggest_anime_names(query, limit=5):
+    """Return close catalog title matches for misspelled user searches."""
+    query_norm = normalize_anime_name(query)
+    if not query_norm:
+        return []
+
+    scored = []
+    for anime in all_anime():
+        anime_id, name, _poster = anime
+        title_norm = normalize_anime_name(name)
+        if not title_norm:
+            continue
+        ratio = difflib.SequenceMatcher(None, query_norm, title_norm).ratio()
+        # Token overlap helps searches like "black clover tamil" find "Black Clover".
+        query_tokens, title_tokens = set(query_norm.split()), set(title_norm.split())
+        overlap = len(query_tokens & title_tokens) / max(1, len(query_tokens | title_tokens))
+        if query_norm in title_norm or title_norm in query_norm:
+            ratio = max(ratio, 0.78)
+        score = max(ratio, overlap * 0.9)
+        if score >= 0.42:
+            scored.append((score, anime_id, name))
+
+    scored.sort(key=lambda item: (-item[0], item[2].casefold()))
+    return [(anime_id, name) for score, anime_id, name in scored[:limit]]
 
 
 def get_anime_by_id(anime_id):
@@ -242,7 +317,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/setexpiry 10 — Set expiry\n"
             "/setphoto Anime — Reply to a photo\n"
             "/setindexchannel — Reply to a forwarded index-channel post, or pass its numeric ID\n"
-            "/list — List anime\n\n"
+            "/list — List anime\n"
+            "/backup — Create and send a database backup\n"
+            "/backupstatus — Show backup status\n\n"
             "👤 Users can send an anime name to search.",
             parse_mode="HTML"
         )
@@ -324,6 +401,54 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "✅ Removed." if remove_anime(name) else "❌ Anime not found."
     )
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create and send a fresh catalog database backup to an authorized admin."""
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admin only.")
+        return
+    try:
+        backup_path = create_database_backup()
+        with open(backup_path, "rb") as backup_file:
+            await update.effective_message.reply_document(
+                document=backup_file,
+                filename=backup_path.name,
+                caption="💾 Anime catalog database backup. Store this file somewhere safe."
+            )
+    except Exception:
+        logger.exception("Admin-triggered backup failed")
+        await update.effective_message.reply_text(
+            "❌ Backup failed. Check the Voroa runtime logs and confirm the database/backup directory is writable."
+        )
+
+
+async def backupstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("❌ Admin only.")
+        return
+    try:
+        backup_dir = Path(BACKUP_DIR)
+        backups = sorted(backup_dir.glob("anime-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not backups:
+            await update.effective_message.reply_text(
+                f"⚠️ No database backups found yet.\nBackup directory: {backup_dir}"
+            )
+            return
+        latest = backups[0]
+        modified = datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        await update.effective_message.reply_text(
+            f"💾 <b>Database Backup Status</b>\n\n"
+            f"Latest backup: <code>{latest.name}</code>\n"
+            f"Created: <b>{modified}</b>\n"
+            f"Saved backups: <b>{len(backups)}</b>\n"
+            f"Automatic interval: <b>{BACKUP_INTERVAL_HOURS} hour(s)</b>\n"
+            f"Directory: <code>{html_escape(str(backup_dir))}</code>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        logger.exception("Could not read backup status")
+        await update.effective_message.reply_text("❌ Could not read backup status. Check the runtime logs.")
 
 
 async def setexpiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,15 +538,31 @@ async def setphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, anime_row=None):
-    name = update.effective_message.text.strip()
+    message = update.effective_message
+    name = (message.text or "").strip() if message else ""
     row = anime_row or get_anime(name)
     if not row:
         site_url = html_escape(index_website_url(), quote=True)
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Try Index", url=index_website_url())]])
-        await update.effective_message.reply_text(
-            "❌ Anime not found. Try the Anime Index website below to browse available channels.\n\n"
-            f'🌐 <a href="{site_url}">Open Anime Index</a>',
-            parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True
+        buttons = []
+        suggestions = suggest_anime_names(name)
+        for suggested_id, suggested_name in suggestions:
+            buttons.append([InlineKeyboardButton(f"🔎 {suggested_name}", callback_data=f"search:{suggested_id}")])
+        buttons.append([InlineKeyboardButton("🌐 Try Index", url=index_website_url())])
+        markup = InlineKeyboardMarkup(buttons)
+        if suggestions:
+            suggestion_text = "\n".join(f"• {html_escape(suggested_name)}" for _, suggested_name in suggestions)
+            text = (
+                f"❌ Couldn't find <b>{html_escape(name)}</b>.\n\n"
+                f"💡 <b>Did you mean:</b>\n{suggestion_text}\n\n"
+                "Tap a suggestion below, or browse the full Anime Index."
+            )
+        else:
+            text = (
+                f"❌ Couldn't find <b>{html_escape(name)}</b>.\n\n"
+                "Try another spelling, or browse the full Anime Index below."
+            )
+        await message.reply_text(
+            text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True
         )
         return
     chs = channels_for(row[0])
@@ -471,6 +612,20 @@ async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, a
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
+    # Search suggestion buttons are available to every user, not only admins.
+    if q.data and q.data.startswith("search:"):
+        try:
+            anime_id = int(q.data.split(":", 1)[1])
+            row = get_anime_by_id(anime_id)
+        except (ValueError, IndexError):
+            row = None
+        if not row:
+            await q.message.reply_text("❌ That anime is no longer in the catalog. Please search again.")
+            return
+        await send_anime_links(update, context, anime_row=row)
+        return
+
     if not is_admin(q.from_user.id):
         await q.answer("Admin only.", show_alert=True)
         return
@@ -609,6 +764,8 @@ async def setup():
     telegram_app.add_handler(CommandHandler("setexpiry", setexpiry_cmd))
     telegram_app.add_handler(CommandHandler("setphoto", setphoto_cmd))
     telegram_app.add_handler(CommandHandler("setindexchannel", setindexchannel_cmd))
+    telegram_app.add_handler(CommandHandler("backup", backup_cmd))
+    telegram_app.add_handler(CommandHandler("backupstatus", backupstatus_cmd))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     telegram_app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, index_channel_post))
     telegram_app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST & filters.TEXT, index_channel_post))
@@ -637,6 +794,8 @@ def _run_bot_loop():
 
 bot_loop_thread = threading.Thread(target=_run_bot_loop, name="telegram-bot-loop", daemon=True)
 bot_loop_thread.start()
+backup_thread = threading.Thread(target=_automatic_backup_loop, name="database-backup-loop", daemon=True)
+backup_thread.start()
 asyncio.run_coroutine_threadsafe(setup(), bot_loop).result(timeout=60)
 
 
