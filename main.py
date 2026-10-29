@@ -689,14 +689,19 @@ async def send_anime_links(update: Update, context: ContextTypes.DEFAULT_TYPE, a
         "👇 Join Channel:"
     )
     markup = InlineKeyboardMarkup(buttons)
-    if row[2]:
-        try:
-            await update.effective_message.reply_photo(
-                photo=row[2], caption=caption, parse_mode="HTML", reply_markup=markup
-            )
-            return
-        except TelegramError as e:
-            logger.warning("Poster send failed: %s", e)
+    poster = row[2] or get_poster_url(row[0])
+
+if poster:
+    try:
+        await update.effective_message.reply_photo(
+            photo=poster,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+        return
+    except TelegramError as e:
+        logger.warning("Poster send failed: %s", e)
     await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
 
 
