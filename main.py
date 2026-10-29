@@ -103,7 +103,55 @@ with db_lock:
         db.execute("ALTER TABLE anime ADD COLUMN poster_url TEXT")
 
     db.commit()
+ANILIST_API_URL = "https://graphql.anilist.co"
 
+
+def fetch_anime_poster(anime_name):
+    """Fetch an anime cover URL from AniList."""
+    query = """
+    query ($search: String) {
+      Media(search: $search, type: ANIME) {
+        id
+        title {
+          romaji
+          english
+          native
+        }
+        coverImage {
+          large
+          extraLarge
+        }
+      }
+    }
+    """
+
+    try:
+        response = requests.post(
+            ANILIST_API_URL,
+            json={
+                "query": query,
+                "variables": {"search": anime_name}
+            },
+            timeout=12
+        )
+        response.raise_for_status()
+
+        media = response.json().get("data", {}).get("Media")
+        if not media:
+            logger.info("No AniList poster found for %s", anime_name)
+            return None
+
+        cover = media.get("coverImage") or {}
+        poster_url = cover.get("extraLarge") or cover.get("large")
+
+        if not poster_url:
+            return None
+
+        return poster_url
+
+    except (requests.RequestException, ValueError, TypeError):
+        logger.exception("Failed to fetch poster for %s", anime_name)
+        return None
 
 
 def _automatic_backup_loop():
@@ -260,6 +308,24 @@ def set_poster(anime_id, file_id):
     with db_lock:
         db.execute("UPDATE anime SET poster_file_id=? WHERE id=?", (file_id, anime_id))
         db.commit()
+
+def save_poster_url(anime_id, poster_url):
+    with db_lock:
+        db.execute(
+            "UPDATE anime SET poster_url=? WHERE id=?",
+            (poster_url, anime_id)
+        )
+        db.commit()
+
+def get_poster_url(anime_id):
+    with db_lock:
+        row = db.execute(
+            "SELECT poster_url FROM anime WHERE id=?",
+            (anime_id,)
+        ).fetchone()
+
+    return row[0] if row else None
+
 
 
 def admin_keyboard():
@@ -523,7 +589,17 @@ async def index_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         source_chat = await context.bot.get_chat(int(source_id))
         row = get_anime(name)
-        anime_id = row[0] if row else add_anime(name)
+anime_id = row[0] if row else add_anime(name)
+
+# Fetch a poster only when this anime doesn't already have one.
+if not row or not row[2]:
+    poster_url = await asyncio.to_thread(
+        fetch_anime_poster, name
+    )
+
+    if poster_url:
+        save_poster_url(anime_id, poster_url)
+        logger.info("Automatically saved poster for %s", name)
         with db_lock:
             exists = db.execute(
                 "SELECT 1 FROM channels WHERE anime_id=? AND chat_id=?",
