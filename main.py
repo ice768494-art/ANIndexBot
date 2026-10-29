@@ -6,6 +6,8 @@ import asyncio
 import re
 import time
 import difflib
+import requests
+from urllib.parse import urlparse
 import unicodedata
 from pathlib import Path
 from html import escape as html_escape
@@ -89,6 +91,19 @@ def create_database_backup():
             logger.warning("Could not remove old database backup %s", old_backup, exc_info=True)
     logger.info("Database backup created: %s", backup_path)
     return backup_path
+
+# Add support for automatically fetched poster URLs.
+with db_lock:
+    columns = {
+        row[1]
+        for row in db.execute("PRAGMA table_info(anime)").fetchall()
+    }
+
+    if "poster_url" not in columns:
+        db.execute("ALTER TABLE anime ADD COLUMN poster_url TEXT")
+
+    db.commit()
+
 
 
 def _automatic_backup_loop():
